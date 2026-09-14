@@ -18,6 +18,7 @@ LRU/TTL bounds.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Iterator, Sequence
 from typing import Any
@@ -315,14 +316,57 @@ class CachedHistorySaver(BaseCheckpointSaver):
         if delete is not None:
             await delete(self._key_prefix, thread_id)
 
+    async def _apurge_threads_after_prune(self, thread_ids: Sequence[str]) -> None:
+        """Finish the mandatory post-prune cache purge before propagating cancellation.
+
+        ``aprune`` rewrites checkpoint ancestry before this cleanup starts. Once
+        that source-of-truth mutation commits, an old cache entry for a retained
+        checkpoint id is no longer immutable: returning before its purge settles
+        can serve pre-prune history. Shield one owned purge task and keep draining
+        it across repeated caller cancellation, then re-raise the first
+        cancellation so cancellation remains observable to the caller.
+        """
+
+        async def purge_all() -> None:
+            for thread_id in thread_ids:
+                await self._apurge_thread(thread_id)
+
+        purge = asyncio.create_task(purge_all())
+        cancellation: asyncio.CancelledError | None = None
+        while True:
+            try:
+                await asyncio.shield(purge)
+            except asyncio.CancelledError as exc:
+                if cancellation is None:
+                    cancellation = exc
+                if not purge.done():
+                    continue
+            except Exception as exc:
+                if cancellation is not None:
+                    raise cancellation from exc
+                raise
+            break
+
+        try:
+            purge.result()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+
+        if cancellation is not None:
+            raise cancellation
+
     async def acopy_thread(self, source_thread_id: str, target_thread_id: str) -> None:
         await self._inner.acopy_thread(source_thread_id, target_thread_id)
 
     async def aprune(self, thread_ids: Sequence[str], *, strategy: str = "keep_latest") -> None:
         await self._inner.aprune(thread_ids, strategy=strategy)
-        # See prune: rewritten chains must not keep pre-prune cached histories.
-        for thread_id in thread_ids:
-            await self._apurge_thread(thread_id)
+        # Rewritten chains must not keep pre-prune cached histories. Once the
+        # inner prune commits, caller cancellation must not detach this purge.
+        await self._apurge_threads_after_prune(thread_ids)
 
     def get_next_version(self, current: Any, channel: Any) -> Any:
         return self._inner.get_next_version(current, channel)
